@@ -567,6 +567,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT6_CLIP_PERCENTILES = (0.9990, 0.9995, 0.9999, 0.99999, 1.0)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -638,6 +639,33 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), qmin, qmax).to(torch.int8).contiguous()
     return q, scale
 
+
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    clip_range = 31
+    if t32.ndim == 2:
+        best_q: Tensor | None = None
+        best_s: Tensor | None = None
+        best_err = float("inf")
+        for pct in INT6_CLIP_PERCENTILES:
+            if pct < 1.0:
+                row_clip = torch.quantile(t32.abs(), pct, dim=1)
+            else:
+                row_clip = t32.abs().amax(dim=1)
+            scale = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(dtype=torch.float16)
+            q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -clip_range, clip_range).to(dtype=torch.int8).contiguous()
+            recon = q.float() * scale.float()[:, None]
+            err = (t32 - recon).pow(2).mean().item()
+            if err < best_err:
+                best_q, best_s, best_err = q, scale.contiguous(), err
+        if best_q is None or best_s is None:
+            raise RuntimeError("int6 quantization failed to produce a candidate")
+        return best_q, best_s
+    amax = t32.abs().max().item() if t32.numel() else 0.0
+    scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(dtype=torch.int8).contiguous()
+    return q, scale
+
 def quantize_float_tensor_codebook4(t: Tensor) -> tuple[Tensor, Tensor]:
     flat = t.float().reshape(-1)
     if flat.numel() == 0:
@@ -656,6 +684,12 @@ def encode_float_tensor(name: str, t: Tensor, scheme: str, passthrough_orig_dtyp
     if scheme == "int8":
         q, s = quantize_float_tensor(t, bits=8)
         meta: dict[str, object] = {"scheme": "int8"}
+        if s.ndim > 0:
+            meta.update({"axis": 0, "per_row": True})
+        return "quantized", q, s, meta
+    if scheme == "int6":
+        q, s = quantize_float_tensor_int6(t)
+        meta = {"scheme": "int6"}
         if s.ndim > 0:
             meta.update({"axis": 0, "per_row": True})
         return "quantized", q, s, meta
@@ -752,6 +786,12 @@ def dequantize_state_dict_artifact(obj: dict[str, object]) -> dict[str, Tensor]:
         scheme = meta.get("scheme", "int8")
         aux = obj["aux"].get(name)
         if scheme == "int8":
+            if aux.ndim > 0:
+                scale = aux.to(dtype=torch.float32).view(q.shape[0], *([1] * (q.ndim - 1)))
+                out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            else:
+                out[name] = (q.float() * float(aux.item())).to(dtype=dtype).contiguous()
+        elif scheme == "int6":
             if aux.ndim > 0:
                 scale = aux.to(dtype=torch.float32).view(q.shape[0], *([1] * (q.ndim - 1)))
                 out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
@@ -926,10 +966,16 @@ class RMSNorm(nn.Module):
 ACTIVE_QAT_BITS = 0
 
 def fake_quantize_weight_ste(weight: Tensor, bits: int) -> Tensor:
-    q, s = quantize_float_tensor(weight, bits=bits)
-    if bits == 4:
-        dq = (q.float() * (s.view(q.shape[0], *([1] * (q.ndim - 1))) if s.ndim > 0 else float(s.item()))).to(weight.dtype)
+    if bits == 6 and weight.ndim == 2:
+        with torch.no_grad():
+            w32 = weight.float()
+            row_max = w32.abs().amax(dim=1)
+            scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+            dq = (
+                torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]
+            ).to(dtype=weight.dtype)
     else:
+        q, s = quantize_float_tensor(weight, bits=bits)
         dq = (q.float() * (s.view(q.shape[0], *([1] * (q.ndim - 1))) if s.ndim > 0 else float(s.item()))).to(weight.dtype)
     return weight + (dq - weight).detach()
 
@@ -939,7 +985,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         weight = self.weight
-        if self.training and ACTIVE_QAT_BITS in {4, 8} and weight.is_floating_point():
+        if self.training and ACTIVE_QAT_BITS in {4, 6, 8} and weight.is_floating_point():
             weight = fake_quantize_weight_ste(weight, ACTIVE_QAT_BITS)
         return F.linear(x, weight.to(x.dtype), bias)
 
@@ -1216,8 +1262,8 @@ def main() -> None:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
     if args.eval_stride > 0 and (args.eval_cache or args.eval_pointer):
         raise ValueError("EVAL_STRIDE cannot be combined with EVAL_CACHE or EVAL_POINTER in the root trainer")
-    if args.qat_bits not in {4, 8}:
-        raise ValueError(f"QAT_BITS must be 4 or 8, got {args.qat_bits}")
+    if args.qat_bits not in {4, 6, 8}:
+        raise ValueError(f"QAT_BITS must be 4, 6, or 8, got {args.qat_bits}")
     if not (0.0 <= args.qat_start_frac <= 1.0):
         raise ValueError(f"QAT_START_FRAC must be in [0, 1], got {args.qat_start_frac}")
     if not (0.0 <= args.ema_decay < 1.0):
@@ -1667,7 +1713,7 @@ def main() -> None:
                 f"total_bytes:{total_bytes} within_budget:{candidate['within_budget']} payload_ratio:{ratio:.2f}x"
             )
 
-        scheme_priority = {"int8": 0, "codebook4": 1, "int4": 2}
+        scheme_priority = {"int8": 0, "int6": 1, "codebook4": 2, "int4": 3}
         selected = min(
             candidates,
             key=lambda item: (
