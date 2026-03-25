@@ -77,12 +77,14 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     backbone_mode = os.environ.get("BACKBONE_MODE", "baseline")
     shared_blocks = int(os.environ.get("SHARED_BLOCKS", 1))
     train_recursion_steps = int(os.environ.get("TRAIN_RECURSION_STEPS", num_layers))
     eval_recursion_steps = int(os.environ.get("EVAL_RECURSION_STEPS", train_recursion_steps))
     stabilization_mode = os.environ.get("STABILIZATION_MODE", "baseline")
+    ln_scale = env_flag("LN_SCALE", False)
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1000,9 +1002,10 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.rope_dims = rope_dims if rope_dims > 0 else dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -1024,6 +1027,13 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    rope_dim = cos.size(-1) * 2
+    if rope_dim < x.size(-1):
+        x_rope, x_pass = x[..., :rope_dim], x[..., rope_dim:]
+        half = rope_dim // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rot = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rot, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -1037,6 +1047,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1055,7 +1066,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -1105,23 +1116,28 @@ class Block(nn.Module):
         qk_gain_init: float,
         stabilization_mode: str,
         residual_scale: float,
+        rope_dims: int,
+        layer_idx: int,
+        ln_scale: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         init = 0.0 if stabilization_mode == "rezero" else residual_scale
         self.attn_scale = nn.Parameter(torch.full((dim,), init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), init, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        norm_scale = self.ln_scale_factor
+        attn_out = self.attn(self.attn_norm(x) * norm_scale)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * norm_scale)
         return x
 
 
@@ -1138,12 +1154,14 @@ class GPT(nn.Module):
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
         backbone_mode: str,
         shared_blocks: int,
         train_recursion_steps: int,
         eval_recursion_steps: int,
         stabilization_mode: str,
+        ln_scale: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1185,8 +1203,11 @@ class GPT(nn.Module):
                     qk_gain_init,
                     stabilization_mode,
                     residual_scale,
+                    rope_dims,
+                    i,
+                    ln_scale,
                 )
-                for _ in range(block_count)
+                for i in range(block_count)
             ]
         )
         self.final_norm = RMSNorm()
@@ -1262,6 +1283,12 @@ def main() -> None:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
     if args.eval_stride > 0 and (args.eval_cache or args.eval_pointer):
         raise ValueError("EVAL_STRIDE cannot be combined with EVAL_CACHE or EVAL_POINTER in the root trainer")
+    head_dim = args.model_dim // args.num_heads
+    rope_dims = args.rope_dims if args.rope_dims > 0 else head_dim
+    if rope_dims <= 0 or rope_dims > head_dim or rope_dims % 2 != 0:
+        raise ValueError(
+            f"ROPE_DIMS must be an even value in (0, {head_dim}] after defaults, got {args.rope_dims}"
+        )
     if args.qat_bits not in {4, 6, 8}:
         raise ValueError(f"QAT_BITS must be 4, 6, or 8, got {args.qat_bits}")
     if not (0.0 <= args.qat_start_frac <= 1.0):
@@ -1370,12 +1397,14 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
+        rope_dims=args.rope_dims,
         qk_gain_init=args.qk_gain_init,
         backbone_mode=args.backbone_mode,
         shared_blocks=args.shared_blocks,
         train_recursion_steps=args.train_recursion_steps,
         eval_recursion_steps=args.eval_recursion_steps,
         stabilization_mode=args.stabilization_mode,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1448,6 +1477,7 @@ def main() -> None:
         f"train_recursion_steps:{args.train_recursion_steps} eval_recursion_steps:{args.eval_recursion_steps} "
         f"stabilization_mode:{args.stabilization_mode}"
     )
+    log0(f"rope:base:{args.rope_base} rope_dims:{args.rope_dims if args.rope_dims > 0 else args.model_dim // args.num_heads} ln_scale:{int(args.ln_scale)}")
     log0(
         f"eval_memory:cache={int(args.eval_cache)} cache_weight:{args.eval_cache_weight:.3f} "
         f"cache_size:{args.eval_cache_size} pointer={int(args.eval_pointer)} "
