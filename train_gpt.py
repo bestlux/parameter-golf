@@ -102,6 +102,8 @@ class Hyperparameters:
     qat_enabled = env_flag("QAT_ENABLED", False)
     qat_bits = int(os.environ.get("QAT_BITS", 8))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.8))
+    ema_enabled = env_flag("EMA_ENABLED", False)
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
     # Runtime knobs for local bringup when some kernels/backends are unavailable.
     compile_model = env_flag("COMPILE_MODEL", True)
@@ -1218,6 +1220,8 @@ def main() -> None:
         raise ValueError(f"QAT_BITS must be 4 or 8, got {args.qat_bits}")
     if not (0.0 <= args.qat_start_frac <= 1.0):
         raise ValueError(f"QAT_START_FRAC must be in [0, 1], got {args.qat_start_frac}")
+    if not (0.0 <= args.ema_decay < 1.0):
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     if args.compile_muon:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -1412,6 +1416,7 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} eval_stride:{args.eval_stride} "
         f"eval_sliding_batch_seqs:{args.eval_sliding_batch_seqs}"
     )
+    log0(f"ema:enabled={int(args.ema_enabled)} decay:{args.ema_decay:.6f}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1483,6 +1488,11 @@ def main() -> None:
     stop_after_step: int | None = None
     last_val_loss = float("nan")
     last_val_bpb = float("nan")
+    ema_state = (
+        {name: tensor.detach().float().clone() for name, tensor in base_model.state_dict().items()}
+        if args.ema_enabled
+        else None
+    )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1552,6 +1562,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if ema_state is not None:
+            with torch.no_grad():
+                for name, tensor in base_model.state_dict().items():
+                    ema_state[name].mul_(args.ema_decay).add_(tensor.detach().float(), alpha=1.0 - args.ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1579,6 +1593,35 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
     ACTIVE_QAT_BITS = 0
+    if ema_state is not None:
+        log0("ema:applying EMA weights")
+        current_state = base_model.state_dict()
+        ema_load_state = {name: tensor.to(dtype=current_state[name].dtype) for name, tensor in ema_state.items()}
+        base_model.load_state_dict(ema_load_state, strict=True)
+        torch.cuda.synchronize()
+        t_ema_eval = time.perf_counter()
+        last_val_loss, last_val_bpb = run_validation(
+            args,
+            model,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        ema_eval_time_ms = 1000.0 * (time.perf_counter() - t_ema_eval)
+        log0(
+            f"ema_postapply val_loss:{last_val_loss:.4f} val_bpb:{last_val_bpb:.4f} "
+            f"eval_time:{ema_eval_time_ms:.0f}ms"
+        )
+        log0(
+            f"ema_postapply_exact val_loss:{last_val_loss:.8f} val_bpb:{last_val_bpb:.8f}"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
