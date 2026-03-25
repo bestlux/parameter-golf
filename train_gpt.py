@@ -995,7 +995,8 @@ class GPT(nn.Module):
             self.num_encoder_layers = 0
             self.num_decoder_layers = 0
             self.num_skip_weights = 0
-            self.skip_weights = nn.Parameter(torch.ones((0, model_dim), dtype=torch.float32))
+            # Avoid registering an unused parameter under DDP in recursive mode.
+            self.register_buffer("skip_weights", torch.ones((0, model_dim), dtype=torch.float32), persistent=False)
             block_count = self.shared_blocks
         self.blocks = nn.ModuleList(
             [
