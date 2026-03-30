@@ -96,6 +96,7 @@ class Hyperparameters:
     eval_recursion_steps = int(os.environ.get("EVAL_RECURSION_STEPS", train_recursion_steps))
     stabilization_mode = os.environ.get("STABILIZATION_MODE", "baseline")
     ln_scale = env_flag("LN_SCALE", False)
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1078,12 +1079,24 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        # Group query heads by KV head and remove the component aligned with each token's own value vector.
+        bsz, num_heads, seqlen, head_dim = y.shape
+        kv_heads = v.size(1)
+        group = num_heads // kv_heads
+        y_grouped = y.reshape(bsz, kv_heads, group, seqlen, head_dim)
+        v_norm = F.normalize(v, dim=-1).unsqueeze(2)
+        projection = (y_grouped * v_norm).sum(dim=-1, keepdim=True) * v_norm
+        return (y_grouped - projection).reshape(bsz, num_heads, seqlen, head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        xsa_v = v
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -1100,6 +1113,8 @@ class CausalSelfAttention(nn.Module):
         if use_gqa:
             sdpa_kwargs["enable_gqa"] = True
         y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+        if self.use_xsa:
+            y = self._xsa_efficient(y, xsa_v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1175,6 +1190,7 @@ class GPT(nn.Module):
         eval_recursion_steps: int,
         stabilization_mode: str,
         ln_scale: bool,
+        xsa_last_n: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1223,6 +1239,9 @@ class GPT(nn.Module):
                 for i in range(block_count)
             ]
         )
+        if xsa_last_n > 0:
+            for i in range(max(0, block_count - xsa_last_n), block_count):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1418,6 +1437,7 @@ def main() -> None:
         eval_recursion_steps=args.eval_recursion_steps,
         stabilization_mode=args.stabilization_mode,
         ln_scale=args.ln_scale,
+        xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1486,6 +1506,8 @@ def main() -> None:
     log0(f"sdpa_enable_gqa_supported:{int(SDPA_SUPPORTS_ENABLE_GQA)}")
     log0(f"torch_compile:model={args.compile_model} muon={args.compile_muon}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    xsa_layers = [i for i, block in enumerate(base_model.blocks) if block.attn.use_xsa]
+    log0(f"xsa:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(
         f"backbone_mode:{args.backbone_mode} shared_blocks:{args.shared_blocks} "
         f"train_recursion_steps:{args.train_recursion_steps} eval_recursion_steps:{args.eval_recursion_steps} "
