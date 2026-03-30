@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import inspect
 import io
 import math
 import os
@@ -38,6 +39,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 def env_flag(name: str, default: bool) -> bool:
     return bool(int(os.environ.get(name, "1" if default else "0")))
+
+
+def sdpa_supports_enable_gqa() -> bool:
+    try:
+        return "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+SDPA_SUPPORTS_ENABLE_GQA = sdpa_supports_enable_gqa()
 
 
 class Hyperparameters:
@@ -1079,14 +1090,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        use_gqa = self.num_kv_heads != self.num_heads
+        if use_gqa and not SDPA_SUPPORTS_ENABLE_GQA:
+            kv_repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(kv_repeat, dim=1)
+            v = v.repeat_interleave(kv_repeat, dim=1)
+            use_gqa = False
+        sdpa_kwargs = {"attn_mask": None, "is_causal": True}
+        if use_gqa:
+            sdpa_kwargs["enable_gqa"] = True
+        y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1470,6 +1483,7 @@ def main() -> None:
         f"cudnn={args.sdp_cudnn} flash={args.sdp_flash} "
         f"mem_efficient={args.sdp_mem_efficient} math={args.sdp_math}"
     )
+    log0(f"sdpa_enable_gqa_supported:{int(SDPA_SUPPORTS_ENABLE_GQA)}")
     log0(f"torch_compile:model={args.compile_model} muon={args.compile_muon}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
