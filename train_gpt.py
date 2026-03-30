@@ -132,7 +132,7 @@ class Hyperparameters:
     artifact_report_verbose = env_flag("ARTIFACT_REPORT_VERBOSE", False)
     export_scheme = os.environ.get("EXPORT_SCHEME", "int8")
     artifact_compiler_schemes = tuple(
-        part.strip() for part in os.environ.get("ARTIFACT_COMPILER_SCHEMES", "int8,int4,codebook4").split(",") if part.strip()
+        part.strip() for part in os.environ.get("ARTIFACT_COMPILER_SCHEMES", "int8,int6,int4,codebook4").split(",") if part.strip()
     )
     export_family_policy = os.environ.get("EXPORT_FAMILY_POLICY", "")
     artifact_eval_all = env_flag("ARTIFACT_EVAL_ALL", False)
@@ -617,6 +617,24 @@ def parse_export_family_policy(raw: str) -> dict[str, str]:
             policy[family] = scheme
     return policy
 
+
+def resolve_export_family_policy(raw: str, default_scheme: str) -> dict[str, str]:
+    policy = parse_export_family_policy(raw)
+    if policy:
+        return policy
+    if default_scheme == "int6":
+        # Mirror the strongest public stack's first-order choice:
+        # keep control tensors in float, bulk attn/mlp at int6, everything else at int8.
+        return {
+            "default": "int8",
+            "control": "keep_fp",
+            "attn": "int6",
+            "mlp": "int6",
+            "embed": "int8",
+            "other": "int8",
+        }
+    return policy
+
 def pack_nibbles(values: Tensor) -> Tensor:
     flat = values.to(dtype=torch.uint8).reshape(-1)
     if flat.numel() % 2:
@@ -654,13 +672,14 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     return q, scale
 
 
-def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor, float]:
     t32 = t.float()
     clip_range = 31
     if t32.ndim == 2:
         best_q: Tensor | None = None
         best_s: Tensor | None = None
         best_err = float("inf")
+        best_pct = 1.0
         for pct in INT6_CLIP_PERCENTILES:
             if pct < 1.0:
                 row_clip = torch.quantile(t32.abs(), pct, dim=1)
@@ -671,14 +690,14 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
             recon = q.float() * scale.float()[:, None]
             err = (t32 - recon).pow(2).mean().item()
             if err < best_err:
-                best_q, best_s, best_err = q, scale.contiguous(), err
+                best_q, best_s, best_err, best_pct = q, scale.contiguous(), err, pct
         if best_q is None or best_s is None:
             raise RuntimeError("int6 quantization failed to produce a candidate")
-        return best_q, best_s
+        return best_q, best_s, best_pct
     amax = t32.abs().max().item() if t32.numel() else 0.0
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(dtype=torch.int8).contiguous()
-    return q, scale
+    return q, scale, 1.0
 
 def quantize_float_tensor_codebook4(t: Tensor) -> tuple[Tensor, Tensor]:
     flat = t.float().reshape(-1)
@@ -702,8 +721,8 @@ def encode_float_tensor(name: str, t: Tensor, scheme: str, passthrough_orig_dtyp
             meta.update({"axis": 0, "per_row": True})
         return "quantized", q, s, meta
     if scheme == "int6":
-        q, s = quantize_float_tensor_int6(t)
-        meta = {"scheme": "int6"}
+        q, s, clip_pct = quantize_float_tensor_int6(t)
+        meta = {"scheme": "int6", "clip_percentile": clip_pct}
         if s.ndim > 0:
             meta.update({"axis": 0, "per_row": True})
         return "quantized", q, s, meta
@@ -867,7 +886,6 @@ def artifact_candidates(
     state_dict: dict[str, Tensor],
     args: Hyperparameters,
 ) -> list[dict[str, object]]:
-    family_policy = parse_export_family_policy(args.export_family_policy)
     default_schemes = (
         args.artifact_compiler_schemes
         if args.export_scheme == "auto"
@@ -875,6 +893,7 @@ def artifact_candidates(
     )
     candidates: list[dict[str, object]] = []
     for scheme in default_schemes:
+        family_policy = resolve_export_family_policy(args.export_family_policy, scheme)
         obj, stats = quantize_state_dict_artifact(state_dict, scheme, family_policy)
         blob, raw_bytes = serialize_artifact(obj)
         quant_file_bytes = len(blob)
@@ -888,6 +907,7 @@ def artifact_candidates(
                 "model_bytes": quant_file_bytes,
                 "payload_bytes": int(stats["payload_bytes"]),
                 "stats": stats,
+                "family_policy": family_policy,
             }
         )
     return candidates
@@ -1773,10 +1793,13 @@ def main() -> None:
             candidate["total_bytes"] = total_bytes
             candidate["within_budget"] = int(total_bytes <= args.artifact_budget_bytes)
             ratio = int(candidate["stats"]["baseline_tensor_bytes"]) / max(int(candidate["payload_bytes"]), 1)
+            family_policy = dict(candidate.get("family_policy", {}))
+            family_policy_str = ",".join(f"{k}={v}" for k, v in sorted(family_policy.items())) or "<default>"
             log0(
                 f"artifact_candidate scheme:{candidate['scheme']} model_bytes:{candidate['model_bytes']} "
                 f"payload_bytes:{candidate['payload_bytes']} raw_torch:{candidate['raw_bytes']} "
-                f"total_bytes:{total_bytes} within_budget:{candidate['within_budget']} payload_ratio:{ratio:.2f}x"
+                f"total_bytes:{total_bytes} within_budget:{candidate['within_budget']} payload_ratio:{ratio:.2f}x "
+                f"family_policy:{family_policy_str}"
             )
 
         scheme_priority = {"int8": 0, "int6": 1, "codebook4": 2, "int4": 3}
