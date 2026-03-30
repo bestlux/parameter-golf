@@ -86,6 +86,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_activation = os.environ.get("MLP_ACTIVATION", "relu2")
+    leaky_relu_negative_slope = float(os.environ.get("LEAKY_RELU_NEGATIVE_SLOPE", 0.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
@@ -1121,15 +1123,21 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, activation: str, negative_slope: float):
         super().__init__()
         hidden = mlp_mult * dim
+        self.activation = activation
+        self.negative_slope = negative_slope
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = self.fc(x)
+        if self.activation == "leaky_relu2":
+            x = F.leaky_relu(x, negative_slope=self.negative_slope)
+        else:
+            x = torch.relu(x)
         return self.proj(x.square())
 
 
@@ -1147,12 +1155,14 @@ class Block(nn.Module):
         rope_dims: int,
         layer_idx: int,
         ln_scale: bool,
+        mlp_activation: str,
+        leaky_relu_negative_slope: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_activation, leaky_relu_negative_slope)
         init = 0.0 if stabilization_mode == "rezero" else residual_scale
         self.attn_scale = nn.Parameter(torch.full((dim,), init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), init, dtype=torch.float32))
@@ -1191,6 +1201,8 @@ class GPT(nn.Module):
         stabilization_mode: str,
         ln_scale: bool,
         xsa_last_n: int,
+        mlp_activation: str,
+        leaky_relu_negative_slope: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1235,6 +1247,8 @@ class GPT(nn.Module):
                     rope_dims,
                     i,
                     ln_scale,
+                    mlp_activation,
+                    leaky_relu_negative_slope,
                 )
                 for i in range(block_count)
             ]
@@ -1325,6 +1339,12 @@ def main() -> None:
         raise ValueError(f"QAT_BITS must be 4, 6, or 8, got {args.qat_bits}")
     if not (0.0 <= args.qat_start_frac <= 1.0):
         raise ValueError(f"QAT_START_FRAC must be in [0, 1], got {args.qat_start_frac}")
+    if args.mlp_activation not in {"relu2", "leaky_relu2"}:
+        raise ValueError(f"MLP_ACTIVATION must be relu2 or leaky_relu2, got {args.mlp_activation!r}")
+    if args.leaky_relu_negative_slope < 0.0:
+        raise ValueError(
+            f"LEAKY_RELU_NEGATIVE_SLOPE must be non-negative, got {args.leaky_relu_negative_slope}"
+        )
     if not (0.0 <= args.ema_decay < 1.0):
         raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     if args.compile_muon:
@@ -1438,6 +1458,8 @@ def main() -> None:
         stabilization_mode=args.stabilization_mode,
         ln_scale=args.ln_scale,
         xsa_last_n=args.xsa_last_n,
+        mlp_activation=args.mlp_activation,
+        leaky_relu_negative_slope=args.leaky_relu_negative_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1512,6 +1534,10 @@ def main() -> None:
         f"backbone_mode:{args.backbone_mode} shared_blocks:{args.shared_blocks} "
         f"train_recursion_steps:{args.train_recursion_steps} eval_recursion_steps:{args.eval_recursion_steps} "
         f"stabilization_mode:{args.stabilization_mode}"
+    )
+    log0(
+        f"mlp:mult:{args.mlp_mult} activation:{args.mlp_activation} "
+        f"leaky_negative_slope:{args.leaky_relu_negative_slope:.3f}"
     )
     log0(f"rope:base:{args.rope_base} rope_dims:{args.rope_dims if args.rope_dims > 0 else args.model_dim // args.num_heads} ln_scale:{int(args.ln_scale)}")
     log0(
