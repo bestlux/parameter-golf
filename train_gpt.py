@@ -116,6 +116,7 @@ class Hyperparameters:
     qat_enabled = env_flag("QAT_ENABLED", False)
     qat_bits = int(os.environ.get("QAT_BITS", 8))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.8))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.0))
     ema_enabled = env_flag("EMA_ENABLED", False)
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
@@ -1345,6 +1346,8 @@ def main() -> None:
         raise ValueError(f"QAT_BITS must be 4, 6, or 8, got {args.qat_bits}")
     if not (0.0 <= args.qat_start_frac <= 1.0):
         raise ValueError(f"QAT_START_FRAC must be in [0, 1], got {args.qat_start_frac}")
+    if not (0.0 <= args.late_qat_threshold <= 1.0):
+        raise ValueError(f"LATE_QAT_THRESHOLD must be in [0, 1], got {args.late_qat_threshold}")
     if not (0.0 <= args.ema_decay < 1.0):
         raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     if args.compile_muon:
@@ -1545,6 +1548,7 @@ def main() -> None:
     )
     log0(
         f"qat:enabled={int(args.qat_enabled)} bits:{args.qat_bits} start_frac:{args.qat_start_frac:.3f} "
+        f"late_threshold:{args.late_qat_threshold:.3f} "
         f"eval_seq_len:{args.eval_seq_len} eval_stride:{args.eval_stride} "
         f"eval_sliding_batch_seqs:{args.eval_sliding_batch_seqs}"
     )
@@ -1667,7 +1671,13 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        ACTIVE_QAT_BITS = args.qat_bits if args.qat_enabled and step >= int(args.iterations * args.qat_start_frac) else 0
+        qat_active = False
+        if args.qat_enabled:
+            if args.late_qat_threshold > 0.0:
+                qat_active = scale < args.late_qat_threshold
+            else:
+                qat_active = step >= int(args.iterations * args.qat_start_frac)
+        ACTIVE_QAT_BITS = args.qat_bits if qat_active else 0
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
